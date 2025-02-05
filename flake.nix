@@ -1,10 +1,10 @@
 {
   inputs = {
     flake-parts.url = "github:hercules-ci/flake-parts";
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  outputs = { self, nixpkgs, ... }@inputs:
+  outputs = { self, ... }@inputs:
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       systems = inputs.nixpkgs.lib.systems.flakeExposed;
       imports = [
@@ -37,13 +37,6 @@
 
           # Custom packages and entrypoint aliases -> 'nix run' or 'nix build'
           packages = packages // { default = packages.levari; };
-        };
-
-      flake =
-        {
-          nixosModules = {
-            levari.imports = [ ./module.nix ];
-          };
         };
     };
 }

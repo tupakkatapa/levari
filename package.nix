@@ -1,5 +1,5 @@
 { rustPlatform
-# , pkgs
+, pkgs
 , lib
 }:
 let
@@ -9,10 +9,10 @@ rustPlatform.buildRustPackage {
   pname = manifest.name;
   inherit (manifest) version;
 
-  # nativeBuildInputs = with pkgs; [ pkg-config ];
-  # buildInputs = with pkgs; [
-  #     # deps
-  # ];
+  nativeBuildInputs = with pkgs; [ pkg-config ];
+  buildInputs = with pkgs; [
+    alsa-lib
+  ];
 
   src = lib.sourceByRegex ./. [
     "^Cargo.toml$"
