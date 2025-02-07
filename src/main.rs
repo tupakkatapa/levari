@@ -16,7 +16,7 @@ use crossterm::{
 };
 use rand::prelude::*;
 use regex::Regex;
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use tui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -26,7 +26,6 @@ use tui::{
     Terminal,
 };
 
-/// Focus options for our three boxes.
 #[derive(PartialEq)]
 enum Focus {
     Vinyl,
@@ -34,35 +33,27 @@ enum Focus {
     SongList,
 }
 
-/// Application modes.
 #[derive(PartialEq)]
 enum AppState {
-    Browsing, // No album playing.
-    Playing,  // An album is inserted.
-    SongList, // The song list view is active.
+    Browsing,
+    Playing,
+    SongList,
 }
 
-/// Simple vinyl simulator.
-///
-/// Usage:
-///     levari -d /path/to/your/artists
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
-    /// Data directory containing album directories (searched recursively)
-    #[arg(short, long)]
-    d: PathBuf,
+    #[arg(short = 'd', long = "datadir")]
+    datadir: PathBuf,
 }
 
-/// A song.
 #[derive(Debug)]
 struct Song {
     title: String,
-    duration: u64, // seconds (computed from file size)
+    duration: u64,
     path: PathBuf,
 }
 
-/// An album.
 #[derive(Debug)]
 struct Album {
     name: String,
@@ -72,28 +63,26 @@ struct Album {
     bookmarked: bool,
 }
 
-/// Application state.
 struct App {
     albums: Vec<Album>,
     state: AppState,
-    selected_index: usize,          // Selected album in Albums box.
-    playing_album: Option<usize>,   // Which album is inserted (if any).
-    playback_start: Option<Instant>,// Start time for current song.
-    pause_duration: Duration,       // Total paused time for current song.
+    selected_index: usize,
+    playing_album: Option<usize>,
+    playback_start: Option<Instant>,
+    pause_duration: Duration,
     paused: bool,
     pause_start: Option<Instant>,
     album_list_state: ListState,
     song_list_state: ListState,
     current_sink: Option<Sink>,
-    current_message: Option<String>,// Shows warnings or status in the footer.
+    current_message: Option<String>,
     volume: f32,
-    current_song_index: usize,      // Which song is currently playing.
-    focus: Focus,                   // Which box has focus.
-    title_phrase: String,           // Randomized phrase for the header only.
-    playback_speed: f32,            // Simulated playback speed (RPM).
-
-    pending_g: bool,                // For handling 'gg' in a vim-like way.
-    message_time: Option<Instant>,  // Timestamp when current_message was set.
+    current_song_index: usize,
+    focus: Focus,
+    title_phrase: String,
+    playback_speed: f32,
+    pending_g: bool,
+    message_time: Option<Instant>,
 }
 
 impl App {
@@ -104,16 +93,18 @@ impl App {
         }
         let mut song_state = ListState::default();
         song_state.select(Some(0));
-
         let phrases = [
             "Spinning Vinyl...",
             "Warm Crackle Vibes",
             "Analog Dreams",
             "Groove On!",
+            "Retro Beats",
+            "Sonic Nostalgia",
+            "Vinyl Vibes",
+            "Spin It to Win It",
         ];
         let mut rng = rand::thread_rng();
         let title_phrase = (&phrases[..]).choose(&mut rng).unwrap().to_string();
-
         App {
             albums,
             state: AppState::Browsing,
@@ -131,19 +122,17 @@ impl App {
             current_song_index: 0,
             focus: Focus::Albums,
             title_phrase,
-            playback_speed: 33.33,
+            playback_speed: 33.0,
             pending_g: false,
             message_time: None,
         }
     }
 
-    // Helper to set a transient (decaying) message in the footer.
     fn set_message(&mut self, msg: impl Into<String>) {
         self.current_message = Some(msg.into());
         self.message_time = Some(Instant::now());
     }
 
-    // Basic album navigation
     fn next_album(&mut self) {
         if self.albums.is_empty() {
             return;
@@ -158,7 +147,6 @@ impl App {
             return;
         }
         if self.selected_index == 0 {
-            // If we're at the top, jump focus to Vinyl (optional convenience).
             self.focus = Focus::Vinyl;
         } else {
             self.selected_index -= 1;
@@ -197,7 +185,6 @@ impl App {
         self.album_list_state.select(Some(next_idx));
     }
 
-    // Song list navigation
     fn next_song(&mut self) {
         if self.focus != Focus::SongList {
             return;
@@ -223,7 +210,6 @@ impl App {
         self.song_list_state.select(Some(prev));
     }
 
-    /// Toggle "bookmark" on the currently selected album (if focus is Albums).
     fn toggle_bookmark(&mut self) {
         if self.focus != Focus::Albums {
             return;
@@ -241,7 +227,6 @@ impl App {
         self.set_message(msg);
     }
 
-    /// Jump to the next bookmarked album (wrap around).
     fn next_bookmark(&mut self) {
         if self.focus != Focus::Albums || self.albums.is_empty() {
             return;
@@ -259,7 +244,6 @@ impl App {
         }
     }
 
-    /// Jump to the previous bookmarked album (wrap around).
     fn prev_bookmark(&mut self) {
         if self.focus != Focus::Albums || self.albums.is_empty() {
             return;
@@ -277,7 +261,6 @@ impl App {
         }
     }
 
-    /// Jump to the currently playing album (if any).
     fn jump_to_playing_album(&mut self) {
         if let Some(p) = self.playing_album {
             self.selected_index = p;
@@ -289,28 +272,23 @@ impl App {
         }
     }
 
-    /// Set focus explicitly.
     fn set_focus(&mut self, new_focus: Focus) {
         self.focus = new_focus;
     }
 
-    /// Handle SHIFT keys to switch focus or do other actions (Shift+H/J/K/L/G).
     fn handle_shift_key(&mut self, key: char) {
         match key {
             'J' => {
-                // SHIFT+J => from Vinyl to Albums
                 if self.focus == Focus::Vinyl {
                     self.focus = Focus::Albums;
                 }
             }
             'K' => {
-                // SHIFT+K => from Albums or SongList to Vinyl
                 if self.focus == Focus::Albums || self.focus == Focus::SongList {
                     self.focus = Focus::Vinyl;
                 }
             }
             'L' => {
-                // SHIFT+L => from Albums to SongList, but only if the album is inserted
                 if self.focus == Focus::Albums {
                     match self.playing_album {
                         Some(idx) if idx == self.selected_index => {
@@ -323,13 +301,11 @@ impl App {
                 }
             }
             'H' => {
-                // SHIFT+H => from SongList to Albums
                 if self.focus == Focus::SongList {
                     self.focus = Focus::Albums;
                 }
             }
             'G' => {
-                // SHIFT+G => bottom of album list
                 if self.focus == Focus::Albums {
                     self.go_to_bottom_album();
                 }
@@ -338,53 +314,37 @@ impl App {
         }
     }
 
-    /// Insert the selected album and start playing from the beginning.
-    /// If another album is already playing, eject it first automatically.
     fn insert_album(&mut self, stream_handle: &OutputStreamHandle) -> Result<(), Box<dyn Error>> {
         if let Some(current_play_idx) = self.playing_album {
             if current_play_idx != self.selected_index {
-                // We are swapping albums automatically.
                 self.eject_current_album();
             } else {
-                // If it's the same album, do nothing special (already playing).
-                // You could decide whether to "restart" if you want.
                 return Ok(());
             }
         }
         self.playing_album = Some(self.selected_index);
         self.state = AppState::Playing;
-
-        // Build sink
         let sink = Sink::try_new(stream_handle)?;
-
-        // Append all songs
         let album = &self.albums[self.selected_index];
         for song in &album.songs {
             let file = File::open(&song.path)?;
             let source = Decoder::new(BufReader::new(file))?;
-            sink.append(source);
+            let factor = self.playback_speed / 33.0;
+            sink.append(source.speed(factor));
         }
         sink.set_volume(self.volume);
-
-        // Let it play immediately
         sink.play();
-
-        // Reset timing state
         self.playback_start = Some(Instant::now());
         self.pause_duration = Duration::from_secs(0);
         self.paused = false;
         self.pause_start = None;
         self.current_song_index = 0;
         self.song_list_state.select(Some(0));
-
-        // Keep the new sink
         self.current_sink = Some(sink);
-
         self.set_message(format!("Album '{}' inserted and playing.", album.name));
         Ok(())
     }
 
-    /// Eject whatever album is currently playing.
     fn eject_current_album(&mut self) {
         if let Some(idx) = self.playing_album {
             let name = self.albums[idx].name.clone();
@@ -399,12 +359,6 @@ impl App {
         }
     }
 
-    /// The Space key main behavior:
-    /// - In Albums focus: Insert the selected album (auto-play). If a different album is already
-    ///   playing, we swap automatically.
-    /// - In Vinyl focus: toggle play/pause.
-    /// - In Song List focus: Skip to the selected song. If a different album was playing,
-    ///   automatically swap to the newly selected album first.
     fn space_action(&mut self, stream_handle: &OutputStreamHandle) -> Result<(), Box<dyn Error>> {
         match self.focus {
             Focus::Albums => {
@@ -420,10 +374,7 @@ impl App {
         Ok(())
     }
 
-    /// Skip to the selected song in the current album. If the album is not inserted
-    /// or a different one is playing, auto-insert (swap) first, then skip.
     fn skip_to_song(&mut self, stream_handle: &OutputStreamHandle) -> Result<(), Box<dyn Error>> {
-        // If the album is not inserted or is different, auto-insert it:
         if self.playing_album != Some(self.selected_index) {
             self.insert_album(stream_handle)?;
         }
@@ -433,19 +384,15 @@ impl App {
             return Ok(());
         }
         let song_title = album.songs[song_index].title.clone();
-
-        // Build a fresh sink, skipping directly to that song:
         let sink = Sink::try_new(stream_handle)?;
-        // Append only from the chosen song onward
         for song in album.songs.iter().skip(song_index) {
             let file = File::open(&song.path)?;
             let source = Decoder::new(BufReader::new(file))?;
-            sink.append(source);
+            let factor = self.playback_speed / 33.0;
+            sink.append(source.speed(factor));
         }
         sink.set_volume(self.volume);
         sink.play();
-
-        // Reset playback state
         self.current_sink = Some(sink);
         self.state = AppState::Playing;
         self.playback_start = Some(Instant::now());
@@ -453,33 +400,84 @@ impl App {
         self.paused = false;
         self.pause_start = None;
         self.current_song_index = song_index;
-
         self.set_message(format!("Skipped to: '{}'", song_title));
         Ok(())
     }
 
+    fn increase_speed(&mut self, stream_handle: &OutputStreamHandle) {
+        self.playback_speed = match self.playback_speed {
+            33.0 => 45.0,
+            45.0 => 78.0,
+            78.0 => 78.0,
+            _ => 33.0,
+        };
+        self.set_message(format!("Speed: {:.0} RPM", self.playback_speed));
+        self.update_speed(stream_handle);
+    }
+    fn decrease_speed(&mut self, stream_handle: &OutputStreamHandle) {
+        self.playback_speed = match self.playback_speed {
+            78.0 => 45.0,
+            45.0 => 33.0,
+            33.0 => 33.0,
+            _ => 33.0,
+        };
+        self.set_message(format!("Speed: {:.0} RPM", self.playback_speed));
+        self.update_speed(stream_handle);
+    }
+    fn update_speed(&mut self, stream_handle: &OutputStreamHandle) {
+        if let Some(current_album_idx) = self.playing_album {
+            let album = &self.albums[current_album_idx];
+            let song_index = self.current_song_index;
+            let effective_elapsed = if let Some(start) = self.playback_start {
+                let raw = start.elapsed();
+                let effective = if self.paused {
+                    self.pause_start.unwrap_or(start).saturating_duration_since(start)
+                } else {
+                    raw
+                }
+                .saturating_sub(self.pause_duration);
+                effective.as_secs_f64()
+            } else {
+                0.0
+            };
+            let cumulative: f64 = album.songs.iter().take(song_index).map(|s| s.duration as f64).sum();
+            let offset_in_current = effective_elapsed - cumulative;
+            let sink = Sink::try_new(stream_handle).unwrap();
+            let factor = self.playback_speed / 33.0;
+            if song_index < album.songs.len() {
+                let current_song = &album.songs[song_index];
+                let file = File::open(&current_song.path).unwrap();
+                let reader = BufReader::new(file);
+                let decoder = Decoder::new(reader).unwrap();
+                let current_source = decoder.skip_duration(Duration::from_secs_f64(offset_in_current));
+                sink.append(current_source.speed(factor));
+            }
+            for song in album.songs.iter().skip(song_index + 1) {
+                let file = File::open(&song.path).unwrap();
+                let source = Decoder::new(BufReader::new(file)).unwrap();
+                sink.append(source.speed(factor));
+            }
+            sink.set_volume(self.volume);
+            sink.play();
+            self.current_sink = Some(sink);
+            let new_start = Instant::now() - Duration::from_secs_f64(effective_elapsed);
+            self.playback_start = Some(new_start);
+        }
+    }
+
     fn increase_volume(&mut self) {
-        self.volume = (self.volume + 0.1).min(2.0);
+        self.volume = (self.volume + 0.01).min(2.0);
         if let Some(ref sink) = self.current_sink {
             sink.set_volume(self.volume);
         }
         self.set_message(format!("Volume: {}%", (self.volume * 100.0) as u32));
     }
     fn decrease_volume(&mut self) {
-        self.volume = (self.volume - 0.1).max(0.0);
+        self.volume = (self.volume - 0.01).max(0.0);
         if let Some(ref sink) = self.current_sink {
             sink.set_volume(self.volume);
         }
         self.set_message(format!("Volume: {}%", (self.volume * 100.0) as u32));
-    }
-
-    fn increase_speed(&mut self) {
-        self.playback_speed = (self.playback_speed + 1.0).min(78.0);
-        self.set_message(format!("Speed: {:.2} RPM", self.playback_speed));
-    }
-    fn decrease_speed(&mut self) {
-        self.playback_speed = (self.playback_speed - 1.0).max(33.33);
-        self.set_message(format!("Speed: {:.2} RPM", self.playback_speed));
     }
 
     fn toggle_pause(&mut self) {
@@ -505,7 +503,6 @@ impl App {
     }
 
     fn on_tick(&mut self) {
-        // Decay messages after ~3 seconds
         if let Some(ts) = self.message_time {
             let timeout = Duration::from_secs(3);
             if ts.elapsed() >= timeout {
@@ -516,7 +513,6 @@ impl App {
     }
 }
 
-/// Render the Vinyl Player box.
 fn render_vinyl_player(app: &App) -> String {
     if let Some(play_idx) = app.playing_album {
         let album = &app.albums[play_idx];
@@ -529,7 +525,6 @@ fn render_vinyl_player(app: &App) -> String {
         let current_elapsed = if let Some(start) = app.playback_start {
             let raw = start.elapsed();
             let effective = if app.paused {
-                // If paused, measure only up to pause_start
                 app.pause_start.unwrap_or(start).saturating_duration_since(start)
             } else {
                 raw
@@ -544,12 +539,13 @@ fn render_vinyl_player(app: &App) -> String {
         let seconds = total_elapsed % 60;
         let status = if app.paused { "Paused" } else { "Playing" };
         format!(
-            "Album: {}\nPath: {}\n\nElapsed: {:02}:{:02}\nVolume: {}%\nStatus: {}",
+            "Album: {}\nPath: {}\n\nElapsed: {:02}:{:02}\nVolume: {}%\nRPM: {:.0} RPM\nStatus: {}",
             album.name,
             album.path.display(),
             minutes,
             seconds,
             (app.volume * 100.0) as u32,
+            app.playback_speed,
             status
         )
     } else {
@@ -557,65 +553,57 @@ fn render_vinyl_player(app: &App) -> String {
     }
 }
 
-/// Draw the UI.
 fn ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, app: &mut App) {
-    // Layout: header, main, footer.
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(0),    // Main
-            Constraint::Length(3), // Footer
-        ])
+        .constraints(
+            [
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(3),
+            ]
+            .as_ref(),
+        )
         .split(f.size());
-
-    // --- Header ---
     let header_text = Spans::from(vec![
         Span::styled(
             "Levari",
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" - "),
-        Span::styled(&app.title_phrase, Style::default().fg(Color::Yellow)),
+        Span::styled(&app.title_phrase, Style::default().fg(Color::Magenta)),
     ]);
     let header = Paragraph::new(header_text).block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(header, main_chunks[0]);
-
-    // --- Main area ---
-    // Split main area vertically: top row (Vinyl Player) and bottom row (Albums, Song List).
     let main_vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(8), Constraint::Min(0)].as_ref())
         .split(main_chunks[1]);
-
-    // Top row: Vinyl Player box.
-    let vinyl_block = if app.focus == Focus::Vinyl {
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Vinyl Player")
-            .border_style(Style::default().fg(Color::Green))
+    let player_border = if app.focus == Focus::Vinyl {
+        Color::Magenta
     } else {
-        Block::default().borders(Borders::ALL).title("Vinyl Player")
+        Color::Yellow
     };
+    let vinyl_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Player")
+        .border_style(Style::default().fg(player_border));
     let vinyl_text = render_vinyl_player(app);
     let vinyl_paragraph = Paragraph::new(vinyl_text).block(vinyl_block);
     f.render_widget(vinyl_paragraph, main_vertical[0]);
-
-    // Bottom row: split horizontally -> Albums (left) and Song List (right).
     let bottom_columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)].as_ref())
         .split(main_vertical[1]);
-
-    // Albums box.
-    let album_block = if app.focus == Focus::Albums {
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Albums")
-            .border_style(Style::default().fg(Color::Green))
+    let album_border = if app.focus == Focus::Albums {
+        Color::Magenta
     } else {
-        Block::default().borders(Borders::ALL).title("Albums")
+        Color::Yellow
     };
+    let album_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Shelf")
+        .border_style(Style::default().fg(album_border));
     let album_items: Vec<ListItem> = app
         .albums
         .iter()
@@ -627,10 +615,7 @@ fn ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, app: &mut App) {
             }
             if app.playing_album == Some(i) {
                 name.push_str(" [INSERTED]");
-                ListItem::new(Spans::from(Span::styled(
-                    name,
-                    Style::default().fg(Color::Blue),
-                )))
+                ListItem::new(Spans::from(Span::styled(name, Style::default().fg(Color::Magenta))))
             } else {
                 ListItem::new(Spans::from(Span::raw(name)))
             }
@@ -638,20 +623,19 @@ fn ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, app: &mut App) {
         .collect();
     let albums_list = List::new(album_items)
         .block(album_block)
-        .highlight_style(Style::default().fg(Color::Yellow))
+        .highlight_style(Style::default().fg(Color::Magenta))
         .highlight_symbol(">> ");
     f.render_stateful_widget(albums_list, bottom_columns[0], &mut app.album_list_state);
-
-    // Song List box.
-    let album_for_songs = &app.albums[app.selected_index];
-    let song_block = if app.focus == Focus::SongList {
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Song List")
-            .border_style(Style::default().fg(Color::Green))
+    let song_border = if app.focus == Focus::SongList {
+        Color::Magenta
     } else {
-        Block::default().borders(Borders::ALL).title("Song List")
+        Color::Yellow
     };
+    let album_for_songs = &app.albums[app.selected_index];
+    let song_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Backside")
+        .border_style(Style::default().fg(song_border));
     let mut cum = 0;
     let song_items: Vec<ListItem> = album_for_songs
         .songs
@@ -671,27 +655,20 @@ fn ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, app: &mut App) {
         .collect();
     let songs_list = List::new(song_items)
         .block(song_block)
-        .highlight_style(Style::default().fg(Color::Cyan));
+        .highlight_style(Style::default().fg(Color::Magenta));
     f.render_widget(songs_list, bottom_columns[1]);
-
-    // --- Footer ---
     let footer_text = if let Some(ref msg) = app.current_message {
         Spans::from(vec![Span::raw(msg)])
     } else {
-        Spans::from(vec![Span::raw(
-            "Controls: Insert - 'Space', Navigate - 'h/j/k/l', Change Focus - 'SHIFT+H/J/K/L', Mark - 'm', Jump Marks - 'n', Jump Playing - 'p', Volume: '+/-', Quit - 'q'",
-        )])
+        Spans::from(vec![Span::raw("Space = Play/Pause/Insert  |  h/j/k/l = Navigate  |  Shift+H/J/K/L = Change Focus  |  m = Bookmark  |  n/N = Next/Prev Bookmark  |  +/- = Volume  |  >/< = Speed  |  q = Quit")])
     };
     let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::TOP));
     f.render_widget(footer, main_chunks[2]);
 }
 
-/// Recursively load all albums from the given directory.
 fn load_albums(dir: &Path) -> Result<Vec<Album>, Box<dyn Error>> {
     let mut albums = Vec::new();
     let album_candidate = load_album(dir)?;
-    // If we detect it has either a cover or at least one song, treat as an album,
-    // else dive deeper.
     if album_candidate.cover.is_some() || !album_candidate.songs.is_empty() {
         albums.push(album_candidate);
     } else {
@@ -706,7 +683,6 @@ fn load_albums(dir: &Path) -> Result<Vec<Album>, Box<dyn Error>> {
     Ok(albums)
 }
 
-/// Load a single album’s info (songs + optional cover).
 fn load_album(dir: &Path) -> Result<Album, Box<dyn Error>> {
     let name = dir
         .file_name()
@@ -714,7 +690,6 @@ fn load_album(dir: &Path) -> Result<Album, Box<dyn Error>> {
         .unwrap_or("Unknown Album")
         .to_string();
     let mut cover = None;
-    // Find a “cover.*” file
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -727,7 +702,6 @@ fn load_album(dir: &Path) -> Result<Album, Box<dyn Error>> {
             }
         }
     }
-    // Gather songs
     let mut songs = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -743,7 +717,6 @@ fn load_album(dir: &Path) -> Result<Album, Box<dyn Error>> {
                         .to_string();
                     let metadata = fs::metadata(&path)?;
                     let file_size = metadata.len();
-                    // Rough guess at duration from file size
                     let duration = if file_size > 0 {
                         (file_size as f64 / 40_000.0).round() as u64
                     } else {
@@ -797,47 +770,49 @@ fn natural_order(a: &Song, b: &Song) -> Ordering {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    let mut albums = load_albums(&args.d)?;
+    let mut albums = load_albums(&args.datadir)?;
     if albums.is_empty() {
-        eprintln!("No albums found in {}", args.d.display());
+        eprintln!("No albums found in {}", args.datadir.display());
         return Ok(());
     }
-
-    // Shuffle for a bit of randomness in the Albums order.
     let mut rng = rand::thread_rng();
     albums.shuffle(&mut rng);
-
     let mut app = App::new(albums);
     let (_stream, stream_handle) = OutputStream::try_default()?;
-
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-
     let tick_rate = Duration::from_millis(250);
     let mut last_tick = Instant::now();
-
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
-
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
-
         if event::poll(timeout)? {
             if let CEvent::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') => break,
-
-                    // SHIFT combos:
-                    KeyCode::Char(c) if c.is_ascii_uppercase() => {
+                    KeyCode::Char('n') => {
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            || key.modifiers.contains(KeyModifiers::SHIFT)
+                        {
+                            app.prev_bookmark();
+                        } else {
+                            app.next_bookmark();
+                        }
+                        app.pending_g = false;
+                    }
+                    KeyCode::Char('N') => {
+                        app.prev_bookmark();
+                        app.pending_g = false;
+                    }
+                    KeyCode::Char(c) if c.is_ascii_uppercase() && c != 'N' => {
                         app.handle_shift_key(c);
                         app.pending_g = false;
                     }
-
-                    // Navigation: hjkl
                     KeyCode::Char('j') => {
                         match app.focus {
                             Focus::Vinyl => app.set_focus(Focus::Albums),
@@ -856,16 +831,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     KeyCode::Char('h') => {
                         if app.focus == Focus::SongList {
-                            // same as SHIFT+H basically
                             app.set_focus(Focus::Albums);
                         } else if app.focus == Focus::Vinyl {
-                            // Eject if in Vinyl focus
                             app.eject_current_album();
                         }
                         app.pending_g = false;
                     }
                     KeyCode::Char('l') => {
-                        // from Albums to SongList (only if inserted)
                         if app.focus == Focus::Albums {
                             match app.playing_album {
                                 Some(idx) if idx == app.selected_index => {
@@ -878,16 +850,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                         app.pending_g = false;
                     }
-
-                    // Space key
                     KeyCode::Char(' ') => {
                         if let Err(e) = app.space_action(&stream_handle) {
                             eprintln!("Error during space action: {}", e);
                         }
                         app.pending_g = false;
                     }
-
-                    // Volume/speed
                     KeyCode::Char('+') | KeyCode::Char('=') => {
                         app.increase_volume();
                         app.pending_g = false;
@@ -897,42 +865,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                         app.pending_g = false;
                     }
                     KeyCode::Char('>') => {
-                        app.increase_speed();
+                        app.increase_speed(&stream_handle);
                         app.pending_g = false;
                     }
                     KeyCode::Char('<') => {
-                        app.decrease_speed();
+                        app.decrease_speed(&stream_handle);
                         app.pending_g = false;
                     }
-
-                    // Bookmarking
                     KeyCode::Char('m') => {
                         app.toggle_bookmark();
                         app.pending_g = false;
                     }
-                    KeyCode::Char('n') => {
-                        app.next_bookmark();
-                        app.pending_g = false;
-                    }
-                    KeyCode::Char('N') => {
-                        app.prev_bookmark();
-                        app.pending_g = false;
-                    }
-
-                    // Jump to playing
                     KeyCode::Char('p') => {
                         app.jump_to_playing_album();
                         app.pending_g = false;
                     }
-
-                    // Vim-like 'gg'
                     KeyCode::Char('g') => {
                         if app.focus == Focus::Albums {
                             if !app.pending_g {
-                                // first 'g'
                                 app.pending_g = true;
                             } else {
-                                // second 'g'
                                 app.go_to_top_album();
                                 app.pending_g = false;
                             }
@@ -940,12 +892,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                             app.pending_g = false;
                         }
                     }
-                    // SHIFT+G is handled above, so do nothing here
                     KeyCode::Char('G') => {
                         app.pending_g = false;
                     }
-
-                    // Ctrl+d / Ctrl+u
                     KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if app.focus == Focus::Albums {
                             app.half_page_down_album();
@@ -958,21 +907,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                         app.pending_g = false;
                     }
-
                     _ => {
-                        // Reset pending_g for any other key
                         app.pending_g = false;
                     }
                 }
             }
         }
-
         if last_tick.elapsed() >= tick_rate {
             app.on_tick();
             last_tick = Instant::now();
         }
     }
-
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -982,4 +927,3 @@ fn main() -> Result<(), Box<dyn Error>> {
     terminal.show_cursor()?;
     Ok(())
 }
-
