@@ -86,7 +86,7 @@ struct App {
 }
 
 impl App {
-    fn new(albums: Vec<Album>) -> App {
+    fn new(albums: Vec<Album>) -> Self {
         let mut album_state = ListState::default();
         if !albums.is_empty() {
             album_state.select(Some(0));
@@ -104,8 +104,8 @@ impl App {
             "Spin It to Win It",
         ];
         let mut rng = rand::thread_rng();
-        let title_phrase = (&phrases[..]).choose(&mut rng).unwrap().to_string();
-        App {
+        let title_phrase = phrases.choose(&mut rng).unwrap().to_string();
+        Self {
             albums,
             state: AppState::Browsing,
             selected_index: 0,
@@ -118,7 +118,7 @@ impl App {
             song_list_state: song_state,
             current_sink: None,
             current_message: None,
-            volume: 1.0,
+            volume: 0.25, // initial volume 25%
             current_song_index: 0,
             focus: Focus::Albums,
             title_phrase,
@@ -133,6 +133,7 @@ impl App {
         self.message_time = Some(Instant::now());
     }
 
+    // --- Navigation Methods ---
     fn next_album(&mut self) {
         if self.albums.is_empty() {
             return;
@@ -170,8 +171,8 @@ impl App {
         if self.albums.is_empty() {
             return;
         }
-        let half = std::cmp::max(1, self.albums.len() / 2);
-        let next_idx = std::cmp::min(self.selected_index + half, self.albums.len() - 1);
+        let half = self.albums.len() / 2;
+        let next_idx = std::cmp::min(self.selected_index + half.max(1), self.albums.len() - 1);
         self.selected_index = next_idx;
         self.album_list_state.select(Some(next_idx));
     }
@@ -179,8 +180,8 @@ impl App {
         if self.albums.is_empty() {
             return;
         }
-        let half = std::cmp::max(1, self.albums.len() / 2);
-        let next_idx = self.selected_index.saturating_sub(half);
+        let half = self.albums.len() / 2;
+        let next_idx = self.selected_index.saturating_sub(half.max(1));
         self.selected_index = next_idx;
         self.album_list_state.select(Some(next_idx));
     }
@@ -211,10 +212,7 @@ impl App {
     }
 
     fn toggle_bookmark(&mut self) {
-        if self.focus != Focus::Albums {
-            return;
-        }
-        if self.albums.is_empty() {
+        if self.focus != Focus::Albums || self.albums.is_empty() {
             return;
         }
         let album = &mut self.albums[self.selected_index];
@@ -226,7 +224,6 @@ impl App {
         };
         self.set_message(msg);
     }
-
     fn next_bookmark(&mut self) {
         if self.focus != Focus::Albums || self.albums.is_empty() {
             return;
@@ -243,7 +240,6 @@ impl App {
             }
         }
     }
-
     fn prev_bookmark(&mut self) {
         if self.focus != Focus::Albums || self.albums.is_empty() {
             return;
@@ -278,45 +274,67 @@ impl App {
 
     fn handle_shift_key(&mut self, key: char) {
         match key {
-            'J' => {
-                if self.focus == Focus::Vinyl {
-                    self.focus = Focus::Albums;
-                }
-            }
-            'K' => {
-                if self.focus == Focus::Albums || self.focus == Focus::SongList {
-                    self.focus = Focus::Vinyl;
-                }
-            }
-            'L' => {
-                if self.focus == Focus::Albums {
-                    match self.playing_album {
-                        Some(idx) if idx == self.selected_index => {
-                            self.focus = Focus::SongList;
-                        }
-                        _ => {
-                            self.set_message("That album is not inserted. Press SPACE to insert.");
-                        }
+            'J' if self.focus == Focus::Vinyl => self.focus = Focus::Albums,
+            'K' if self.focus == Focus::Albums || self.focus == Focus::SongList => self.focus = Focus::Vinyl,
+            'L' if self.focus == Focus::Albums => {
+                if let Some(idx) = self.playing_album {
+                    if idx == self.selected_index {
+                        self.focus = Focus::SongList;
+                    } else {
+                        self.set_message("That album is not inserted. Press ENTER to insert.");
                     }
+                } else {
+                    self.set_message("That album is not inserted. Press ENTER to insert.");
                 }
             }
-            'H' => {
-                if self.focus == Focus::SongList {
-                    self.focus = Focus::Albums;
-                }
-            }
-            'G' => {
-                if self.focus == Focus::Albums {
-                    self.go_to_bottom_album();
-                }
-            }
+            'H' if self.focus == Focus::SongList => self.focus = Focus::Albums,
+            'G' if self.focus == Focus::Albums => self.go_to_bottom_album(),
             _ => {}
         }
     }
 
+    // --- Helper Functions ---
+    fn playback_factor(&self) -> f32 {
+        self.playback_speed / 33.0
+    }
+
+    fn effective_elapsed(&self) -> f64 {
+        if let Some(start) = self.playback_start {
+            let raw = start.elapsed();
+            let effective = if self.paused {
+                self.pause_start.unwrap_or(start).saturating_duration_since(start)
+            } else {
+                raw
+            }
+            .saturating_sub(self.pause_duration);
+            effective.as_secs_f64()
+        } else {
+            0.0
+        }
+    }
+
+    fn create_album_sink(
+        &self,
+        stream_handle: &OutputStreamHandle,
+        album: &Album,
+        start_index: usize,
+    ) -> Result<Sink, Box<dyn Error>> {
+        let sink = Sink::try_new(stream_handle)?;
+        let factor = self.playback_factor();
+        for song in album.songs.iter().skip(start_index) {
+            let file = File::open(&song.path)?;
+            let source = Decoder::new(BufReader::new(file))?;
+            sink.append(source.speed(factor));
+        }
+        sink.set_volume(self.volume);
+        sink.play();
+        Ok(sink)
+    }
+
+    // --- Player Actions ---
     fn insert_album(&mut self, stream_handle: &OutputStreamHandle) -> Result<(), Box<dyn Error>> {
-        if let Some(current_play_idx) = self.playing_album {
-            if current_play_idx != self.selected_index {
+        if let Some(current) = self.playing_album {
+            if current != self.selected_index {
                 self.eject_current_album();
             } else {
                 return Ok(());
@@ -324,16 +342,8 @@ impl App {
         }
         self.playing_album = Some(self.selected_index);
         self.state = AppState::Playing;
-        let sink = Sink::try_new(stream_handle)?;
         let album = &self.albums[self.selected_index];
-        for song in &album.songs {
-            let file = File::open(&song.path)?;
-            let source = Decoder::new(BufReader::new(file))?;
-            let factor = self.playback_speed / 33.0;
-            sink.append(source.speed(factor));
-        }
-        sink.set_volume(self.volume);
-        sink.play();
+        let sink = self.create_album_sink(stream_handle, album, 0)?;
         self.playback_start = Some(Instant::now());
         self.pause_duration = Duration::from_secs(0);
         self.paused = false;
@@ -359,40 +369,22 @@ impl App {
         }
     }
 
-    fn space_action(&mut self, stream_handle: &OutputStreamHandle) -> Result<(), Box<dyn Error>> {
-        match self.focus {
-            Focus::Albums => {
-                self.insert_album(stream_handle)?;
-            }
-            Focus::Vinyl => {
-                self.toggle_pause();
-            }
-            Focus::SongList => {
-                self.skip_to_song(stream_handle)?;
-            }
-        }
+    // SPACE toggles pause
+    fn space_action(&mut self, _stream_handle: &OutputStreamHandle) -> Result<(), Box<dyn Error>> {
+        self.toggle_pause();
         Ok(())
     }
 
+    // Always recreates the sink so that skipping starts at the selected song.
     fn skip_to_song(&mut self, stream_handle: &OutputStreamHandle) -> Result<(), Box<dyn Error>> {
-        if self.playing_album != Some(self.selected_index) {
-            self.insert_album(stream_handle)?;
-        }
+        self.playing_album = Some(self.selected_index);
         let album = &self.albums[self.selected_index];
         let song_index = self.song_list_state.selected().unwrap_or(0);
         if song_index >= album.songs.len() {
             return Ok(());
         }
         let song_title = album.songs[song_index].title.clone();
-        let sink = Sink::try_new(stream_handle)?;
-        for song in album.songs.iter().skip(song_index) {
-            let file = File::open(&song.path)?;
-            let source = Decoder::new(BufReader::new(file))?;
-            let factor = self.playback_speed / 33.0;
-            sink.append(source.speed(factor));
-        }
-        sink.set_volume(self.volume);
-        sink.play();
+        let sink = self.create_album_sink(stream_handle, album, song_index)?;
         self.current_sink = Some(sink);
         self.state = AppState::Playing;
         self.playback_start = Some(Instant::now());
@@ -428,22 +420,11 @@ impl App {
         if let Some(current_album_idx) = self.playing_album {
             let album = &self.albums[current_album_idx];
             let song_index = self.current_song_index;
-            let effective_elapsed = if let Some(start) = self.playback_start {
-                let raw = start.elapsed();
-                let effective = if self.paused {
-                    self.pause_start.unwrap_or(start).saturating_duration_since(start)
-                } else {
-                    raw
-                }
-                .saturating_sub(self.pause_duration);
-                effective.as_secs_f64()
-            } else {
-                0.0
-            };
+            let effective_elapsed = self.effective_elapsed();
             let cumulative: f64 = album.songs.iter().take(song_index).map(|s| s.duration as f64).sum();
             let offset_in_current = effective_elapsed - cumulative;
+            let factor = self.playback_factor();
             let sink = Sink::try_new(stream_handle).unwrap();
-            let factor = self.playback_speed / 33.0;
             if song_index < album.songs.len() {
                 let current_song = &album.songs[song_index];
                 let file = File::open(&current_song.path).unwrap();
@@ -485,8 +466,7 @@ impl App {
             if self.paused {
                 sink.play();
                 if let Some(pause_start) = self.pause_start {
-                    let paused_time = pause_start.elapsed();
-                    self.pause_duration += paused_time;
+                    self.pause_duration += pause_start.elapsed();
                 }
                 self.paused = false;
                 self.pause_start = None;
@@ -504,8 +484,7 @@ impl App {
 
     fn on_tick(&mut self) {
         if let Some(ts) = self.message_time {
-            let timeout = Duration::from_secs(3);
-            if ts.elapsed() >= timeout {
+            if ts.elapsed() >= Duration::from_secs(3) {
                 self.current_message = None;
                 self.message_time = None;
             }
@@ -516,21 +495,9 @@ impl App {
 fn render_vinyl_player(app: &App) -> String {
     if let Some(play_idx) = app.playing_album {
         let album = &app.albums[play_idx];
-        let cumulative: u64 = album
-            .songs
-            .iter()
-            .take(app.current_song_index)
-            .map(|s| s.duration)
-            .sum();
-        let current_elapsed = if let Some(start) = app.playback_start {
-            let raw = start.elapsed();
-            let effective = if app.paused {
-                app.pause_start.unwrap_or(start).saturating_duration_since(start)
-            } else {
-                raw
-            }
-            .saturating_sub(app.pause_duration);
-            effective.as_secs()
+        let cumulative: u64 = album.songs.iter().take(app.current_song_index).map(|s| s.duration).sum();
+        let current_elapsed = if app.playback_start.is_some() {
+            app.effective_elapsed() as u64
         } else {
             0
         };
@@ -556,34 +523,22 @@ fn render_vinyl_player(app: &App) -> String {
 fn ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, app: &mut App) {
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
-            ]
-            .as_ref(),
-        )
+        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3)].as_ref())
         .split(f.size());
+
     let header_text = Spans::from(vec![
-        Span::styled(
-            "Levari",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("Levari", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::raw(" - "),
         Span::styled(&app.title_phrase, Style::default().fg(Color::Magenta)),
     ]);
     let header = Paragraph::new(header_text).block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(header, main_chunks[0]);
+
     let main_vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(8), Constraint::Min(0)].as_ref())
         .split(main_chunks[1]);
-    let player_border = if app.focus == Focus::Vinyl {
-        Color::Magenta
-    } else {
-        Color::Yellow
-    };
+    let player_border = if app.focus == Focus::Vinyl { Color::Magenta } else { Color::Yellow };
     let vinyl_block = Block::default()
         .borders(Borders::ALL)
         .title("Player")
@@ -591,15 +546,12 @@ fn ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, app: &mut App) {
     let vinyl_text = render_vinyl_player(app);
     let vinyl_paragraph = Paragraph::new(vinyl_text).block(vinyl_block);
     f.render_widget(vinyl_paragraph, main_vertical[0]);
+
     let bottom_columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)].as_ref())
         .split(main_vertical[1]);
-    let album_border = if app.focus == Focus::Albums {
-        Color::Magenta
-    } else {
-        Color::Yellow
-    };
+    let album_border = if app.focus == Focus::Albums { Color::Magenta } else { Color::Yellow };
     let album_block = Block::default()
         .borders(Borders::ALL)
         .title("Shelf")
@@ -626,11 +578,8 @@ fn ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, app: &mut App) {
         .highlight_style(Style::default().fg(Color::Magenta))
         .highlight_symbol(">> ");
     f.render_stateful_widget(albums_list, bottom_columns[0], &mut app.album_list_state);
-    let song_border = if app.focus == Focus::SongList {
-        Color::Magenta
-    } else {
-        Color::Yellow
-    };
+
+    let song_border = if app.focus == Focus::SongList { Color::Magenta } else { Color::Yellow };
     let album_for_songs = &app.albums[app.selected_index];
     let song_block = Block::default()
         .borders(Borders::ALL)
@@ -657,10 +606,11 @@ fn ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, app: &mut App) {
         .block(song_block)
         .highlight_style(Style::default().fg(Color::Magenta));
     f.render_widget(songs_list, bottom_columns[1]);
+
     let footer_text = if let Some(ref msg) = app.current_message {
         Spans::from(vec![Span::raw(msg)])
     } else {
-        Spans::from(vec![Span::raw("Space = Play/Pause/Insert  |  h/j/k/l = Navigate  |  Shift+H/J/K/L = Change Focus  |  m = Bookmark  |  n/N = Next/Prev Bookmark  |  +/- = Volume  |  >/< = Speed  |  q = Quit")])
+        Spans::from(vec![Span::raw("Space = Play/Pause  |  Enter = Insert/Eject/Skip  |  h/j/k/l = Navigate  |  Shift+H/J/K/L = Change Focus  |  m = Bookmark  |  n/N = Next/Prev Bookmark  |  +/- = Volume  |  >/< = Speed  |  q = Quit")])
     };
     let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::TOP));
     f.render_widget(footer, main_chunks[2]);
@@ -708,8 +658,7 @@ fn load_album(dir: &Path) -> Result<Album, Box<dyn Error>> {
         let path = entry.path();
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let ext = ext.to_lowercase();
-                if ["mp3", "flac", "wav", "ogg"].contains(&ext.as_str()) {
+                if ["mp3", "flac", "wav", "ogg"].contains(&ext.to_lowercase().as_str()) {
                     let song_title = path
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -839,20 +788,38 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     KeyCode::Char('l') => {
                         if app.focus == Focus::Albums {
-                            match app.playing_album {
-                                Some(idx) if idx == app.selected_index => {
-                                    app.set_focus(Focus::SongList);
-                                }
-                                _ => {
-                                    app.set_message("That album is not inserted. Press SPACE to insert.");
-                                }
-                            }
+                            app.set_focus(Focus::SongList);
+                            let song_idx = if app.playing_album == Some(app.selected_index) {
+                                app.current_song_index
+                            } else {
+                                0
+                            };
+                            app.song_list_state.select(Some(song_idx));
                         }
                         app.pending_g = false;
                     }
                     KeyCode::Char(' ') => {
                         if let Err(e) = app.space_action(&stream_handle) {
-                            eprintln!("Error during space action: {}", e);
+                            eprintln!("Error: {}", e);
+                        }
+                        app.pending_g = false;
+                    }
+                    KeyCode::Enter => {
+                        match app.focus {
+                            Focus::Albums | Focus::Vinyl => {
+                                if app.playing_album == Some(app.selected_index) {
+                                    app.eject_current_album();
+                                } else {
+                                    if let Err(e) = app.insert_album(&stream_handle) {
+                                        eprintln!("Error inserting album: {}", e);
+                                    }
+                                }
+                            }
+                            Focus::SongList => {
+                                if let Err(e) = app.skip_to_song(&stream_handle) {
+                                    eprintln!("Error skipping to song: {}", e);
+                                }
+                            }
                         }
                         app.pending_g = false;
                     }
