@@ -478,7 +478,7 @@ impl App {
                 self.set_message("Paused.");
             }
         } else {
-            self.set_message("No album is inserted yet.");
+            self.set_message("No album is inserted yet. Press ENTER to insert.");
         }
     }
 
